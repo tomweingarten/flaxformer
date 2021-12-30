@@ -900,7 +900,7 @@ class MultiHeadDotProductAttention(nn.Module, DenseAttention):
       dim = query.shape[-1]
       max_length = max(query.shape[1], key.shape[1])
       sin, cos = embedding.generate_fixed_pos_embedding(
-          dim, max_length, max_timescale=self.max_timescale)
+          dim, max_length, max_timescale=self.rotary_embedding_max_timescale)
       query, key = embedding.apply_rotary_embedding(
           query,
           key,
@@ -978,7 +978,6 @@ class MultiHeadLinearAttention(nn.Module, LinearAttention):
         numerical issues with bfloat16.
       output_projection: Project the output of `attention_fn` to `out_features`.
         If False, returns the output of `attention_fn` without a projection.
-      sow_intermediates: whether to track intermediates using Module.sow.
       split_head_kernel: whether to store QKVO variables with a split head
         dimension.
       kernels_to_fuse: Which kernels to fuse, if any.
@@ -1382,7 +1381,7 @@ class MultiHeadLinearAttention(nn.Module, LinearAttention):
       dim = query.shape[-1]
       max_length = max(query.shape[1], key.shape[1])
       sin, cos = embedding.generate_fixed_pos_embedding(
-          dim, max_length, max_timescale=self.max_timescale)
+          dim, max_length, max_timescale=self.rotary_embedding_max_timescale)
       query, key = embedding.apply_rotary_embedding(
           query,
           key,
