@@ -621,6 +621,7 @@ class Encoder(nn.Module, param_remapping.ParameterRemappable):
   spmd_annotations: Any = None
   shared_relative_position_bias_factory: Optional[Callable[[],
                                                            nn.Module]] = None
+  tie_weights: bool = False
 
   # Embedders: Either a token_embedder_factory factory or shared token embedder
   # must be provided. The position embedder is optional and provided when
@@ -659,8 +660,13 @@ class Encoder(nn.Module, param_remapping.ParameterRemappable):
         self.shared_relative_position_bias_factory()
         if self.shared_relative_position_bias_factory is not None else None)
 
-    lyrf = lambda: self.layer_factory(  # pylint: disable=g-long-lambda
-        shared_relative_position_bias=self.relpos_bias)
+    if self.tie_weights:
+      shared_layer = self.layer_factory(  # pylint: disable=g-long-lambda
+          shared_relative_position_bias=self.relpos_bias)
+      lyrf = lambda: shared_layer
+    else:
+      lyrf = lambda: self.layer_factory(  # pylint: disable=g-long-lambda
+          shared_relative_position_bias=self.relpos_bias)
     lyrf = maybe_remat(
         lyrf, self.layer_remat, self.scan_layers, static_argnums=(3,))
     if not self.scan_layers:
@@ -830,6 +836,7 @@ class Decoder(nn.Module, param_remapping.ParameterRemappable):
   position_embedder_factory: Optional[Callable[[], embedding.Embed]] = None
 
   sow_intermediates: bool = False
+  tie_weights: bool = False
 
   def setup(self):
     # Set up the embedders.
@@ -861,8 +868,13 @@ class Decoder(nn.Module, param_remapping.ParameterRemappable):
         self.shared_relative_position_bias_factory()
         if self.shared_relative_position_bias_factory is not None else None)
 
-    lyrf = lambda: self.layer_factory(  # pylint: disable=g-long-lambda
-        shared_relative_position_bias=self.relpos_bias)
+    if self.tie_weights:
+      shared_layer = self.layer_factory(  # pylint: disable=g-long-lambda
+          shared_relative_position_bias=self.relpos_bias)
+      lyrf = lambda: shared_layer
+    else:
+      lyrf = lambda: self.layer_factory(  # pylint: disable=g-long-lambda
+          shared_relative_position_bias=self.relpos_bias)
     lyrf = maybe_remat(
         lyrf,
         self.layer_remat,
