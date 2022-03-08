@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC.
+# Copyright 2022 Google LLC.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ import chex
 from flax import linen as nn
 import flax.core.variables as variables
 from flax.linen import initializers
+from flax.linen import partitioning as flax_partitioning
 from flax.linen.linear import default_kernel_init
 from flax.training import common_utils
 import jax
@@ -411,6 +412,12 @@ class MultiHeadDotProductAttention(nn.Module, DenseAttention):
       precision: numerical precision of the computation see `jax.lax.Precision`
         for details.
       kernel_init: initializer for the kernel of the Dense layers.
+      qkv_kernel_init: optional initializer for the fused qkv kernel. If None,
+        kernel_init will be used instead.
+      kv_kernel_init: optional initializer for the fused kv kernel. If None,
+        kernel_init will be used instead.
+      q_kernel_init: optional initializer for the query (q) kernel. If None,
+        kernel_init will be used instead.
       bias_init: initializer for the bias of the Dense layers.
       attention_fn: dot_product_attention or compatible function. Accepts query,
         key, value, and returns output of shape `[bs, dim1, dim2, ..., dimN,,
@@ -436,6 +443,9 @@ class MultiHeadDotProductAttention(nn.Module, DenseAttention):
   dropout_rate: float = 0.
   precision: Optional[lax.Precision] = None
   kernel_init: Initializer = default_kernel_init
+  qkv_kernel_init: Optional[Initializer] = None
+  kv_kernel_init: Optional[Initializer] = None
+  q_kernel_init: Optional[Initializer] = None
   bias_init: Initializer = initializers.zeros
   rescale_logits: bool = False
   compute_attention_fn: Callable[..., Array] = staticmethod(
@@ -454,6 +464,9 @@ class MultiHeadDotProductAttention(nn.Module, DenseAttention):
   # Whether to shard over the head dimension, setting this to False when the
   # number of heads is not divisible your activation num_partitions
   sharding_over_head_dimension: bool = True
+  q_conv: Optional[nn.Module] = None
+  k_conv: Optional[nn.Module] = None
+  v_conv: Optional[nn.Module] = None
 
   def update_cache_prefill(
       self, key: Array, value: Array, cached_key: variables.Variable,
@@ -637,11 +650,21 @@ class MultiHeadDotProductAttention(nn.Module, DenseAttention):
       If output_projection is True, then output of shape
       `[batch_sizes..., length, out_features]`, where out_features is set to
       features if not provided. If output_projection is False, then output of
-      shape `[batch_sizes..., length, qkv_features]`, where qkv_features is set
-      to features if not provided.
+      shape `[batch_sizes..., length, num_heads, head_dim]`.
     """
     validate_dense_attention_call_eter_shapes(inputs_q, inputs_kv, mask,
                                                    bias, self.num_heads)
+
+    qkv_kernel_init = (
+        self.qkv_kernel_init
+        if self.qkv_kernel_init is not None else self.kernel_init)
+    kv_kernel_init = (
+        self.kv_kernel_init
+        if self.kv_kernel_init is not None else self.kernel_init)
+    q_kernel_init = (
+        self.q_kernel_init
+        if self.q_kernel_init is not None else self.kernel_init)
+
     if precomputed_qkv is not None:
       raise ValueError('Support for precomputed QKVO not implemented.')
 
@@ -659,13 +682,13 @@ class MultiHeadDotProductAttention(nn.Module, DenseAttention):
 
     # Is attention logit rescaling explicit or folded into initializer?
     if self.rescale_logits:
-      query_init = self.kernel_init
+      query_init = q_kernel_init
     else:
       if self.kernels_to_fuse:
         raise ValueError('Cannot fold in logit normalization to query '
                          'initializer when using fused kernels.')
       depth_scaling = jnp.sqrt(head_dim).astype(self.dtype)
-      query_init = lambda *args: self.kernel_init(*args) / depth_scaling
+      query_init = lambda *args: q_kernel_init(*args) / depth_scaling
 
     make_dense = functools.partial(
         dense.DenseGeneral,
@@ -683,19 +706,19 @@ class MultiHeadDotProductAttention(nn.Module, DenseAttention):
       query = make_dense(
           kernel_init=query_init,
           features=(self.num_heads, head_dim),
-          kernel_axis_names=['embed', 'heads', 'head_dim'],
+          kernel_axis_names=['embed', 'heads', 'kv'],
           name='query')(
               inputs_q)
       key = make_dense(
           kernel_init=self.kernel_init,
           features=(self.num_heads, head_dim),
-          kernel_axis_names=['embed', 'heads', 'head_dim'],
+          kernel_axis_names=['embed', 'heads', 'kv'],
           name='key')(
               inputs_kv)
       value = make_dense(
           kernel_init=self.kernel_init,
           features=(self.num_heads, head_dim),
-          kernel_axis_names=['embed', 'heads', 'head_dim'],
+          kernel_axis_names=['embed', 'heads', 'kv'],
           name='value')(
               inputs_kv)
     # TODO: should we fuse/slice along depth or head dim?
@@ -705,9 +728,9 @@ class MultiHeadDotProductAttention(nn.Module, DenseAttention):
                          '(when inputs_q is inputs_kv).')
       # 'qkv' fusion mode implies self-attention
       qkv = make_dense(
-          kernel_init=self.kernel_init,
+          kernel_init=qkv_kernel_init,
           features=(3, self.num_heads, head_dim),
-          kernel_axis_names=['embed', 'unmodeled', 'heads', 'head_dim'],
+          kernel_axis_names=['embed', 'stack', 'heads', 'kv'],
           name='qkv_fused')(
               inputs_q)
       query = jnp.squeeze(lax.dynamic_slice_in_dim(qkv, 0, 1, -3), -3)
@@ -717,13 +740,13 @@ class MultiHeadDotProductAttention(nn.Module, DenseAttention):
       query = make_dense(
           kernel_init=query_init,
           features=(self.num_heads, head_dim),
-          kernel_axis_names=['embed', 'heads', 'head_dim'],
+          kernel_axis_names=['embed', 'heads', 'kv'],
           name='query')(
               inputs_q)
       kv = make_dense(
-          kernel_init=self.kernel_init,
+          kernel_init=kv_kernel_init,
           features=(2, self.num_heads, head_dim),
-          kernel_axis_names=['embed', 'unmodeled', 'heads', 'head_dim'],
+          kernel_axis_names=['embed', 'stack', 'heads', 'kv'],
           name='kv_fused')(
               inputs_kv)
       key = jnp.squeeze(lax.dynamic_slice_in_dim(kv, 0, 1, -3), -3)
@@ -731,10 +754,42 @@ class MultiHeadDotProductAttention(nn.Module, DenseAttention):
     else:
       raise ValueError('Incorrect kernel fusion mode specified.')
 
+    # Multi Dconv Head Attention options:
+    if self.q_conv is not None:
+      query = self.q_conv(  # pylint: disable=not-callable
+          query,
+          decode=decode,
+          prefill=prefill,
+          prefill_lengths=prefill_lengths)
+    if self.k_conv is not None:
+      key = self.k_conv(  # pylint: disable=not-callable
+          key,
+          decode=decode,
+          prefill=prefill,
+          prefill_lengths=prefill_lengths)
+    if self.v_conv is not None:
+      value = self.v_conv(  # pylint: disable=not-callable
+          value,
+          decode=decode,
+          prefill=prefill,
+          prefill_lengths=prefill_lengths)
+
     if self.sharding_over_head_dimension:
-      query = activation_partitioning.with_sharding(query, 2)
-      key = activation_partitioning.with_sharding(key, 2)
-      value = activation_partitioning.with_sharding(value, 2)
+      # Note: We don't use `activation_partitioning.with_sharding_migration`
+      # here because we do often want this 2D sharded. However, if rules are
+      # valid, they should result in 2D sharding. We don't need to raise errors
+      # if both result in 2D sharding (which with_sharding_migration does).
+      if flax_partitioning.get_axis_rules():
+        query = flax_partitioning.with_sharding_constraint(
+            query, ('batch', 'length', 'heads', 'kv'))
+        key = flax_partitioning.with_sharding_constraint(
+            key, ('batch', 'length', 'heads', 'kv'))
+        value = flax_partitioning.with_sharding_constraint(
+            value, ('batch', 'length', 'heads', 'kv'))
+      else:
+        query = activation_partitioning.with_sharding(query, 2)
+        key = activation_partitioning.with_sharding(key, 2)
+        value = activation_partitioning.with_sharding(value, 2)
 
     query: Array = query  # hint to quiet pytype.
     key: Array = key
@@ -915,7 +970,7 @@ class MultiHeadDotProductAttention(nn.Module, DenseAttention):
         dtype=self.dtype,
         precision=self.precision,
         reshape_kernel=not self.split_head_kernel,
-        kernel_axis_names=['heads', 'head_dim', 'embed'],
+        kernel_axis_names=['heads', 'kv', 'embed'],
         name='out')(  # pytype: disable=wrong-arg-types
             x)
     return out
@@ -971,6 +1026,9 @@ class MultiQueryDotProductAttention(nn.Module, DenseAttention):
   use_rotary_embedding: bool = False
   rotary_embedding_max_timescale: float = 1e4
   split_head_kernel: bool = False
+  q_conv: Optional[nn.Module] = None
+  k_conv: Optional[nn.Module] = None
+  v_conv: Optional[nn.Module] = None
 
   def update_cache_prefill(
       self, key: Array, value: Array, cached_key: variables.Variable,
@@ -1152,7 +1210,7 @@ class MultiQueryDotProductAttention(nn.Module, DenseAttention):
         dtype=self.dtype,
         kernel_init=query_init,
         precision=self.precision,
-        kernel_axis_names=['embed', 'heads', 'head_dim'],
+        kernel_axis_names=['embed', 'heads', 'kv'],
         reshape_kernel=not self.split_head_kernel)
 
     dense_kv = functools.partial(
@@ -1164,7 +1222,7 @@ class MultiQueryDotProductAttention(nn.Module, DenseAttention):
         dtype=self.dtype,
         kernel_init=self.kernel_init,
         precision=self.precision,
-        kernel_axis_names=['embed', 'head_dim'],
+        kernel_axis_names=['embed', 'kv'],
     )
 
     # Project inputs_q to multi-headed q and single-headed k and v
@@ -1177,7 +1235,34 @@ class MultiQueryDotProductAttention(nn.Module, DenseAttention):
     else:
       query, key, value = precomputed_qkv
 
-    query = activation_partitioning.with_sharding(query, 2)
+    # Multi Dconv Head Attention options:
+    if self.q_conv is not None:
+      query = self.q_conv(  # pylint: disable=not-callable
+          query,
+          decode=decode,
+          prefill=prefill,
+          prefill_lengths=prefill_lengths)
+    if self.k_conv is not None:
+      key = self.k_conv(  # pylint: disable=not-callable
+          key,
+          decode=decode,
+          prefill=prefill,
+          prefill_lengths=prefill_lengths)
+    if self.v_conv is not None:
+      value = self.v_conv(  # pylint: disable=not-callable
+          value,
+          decode=decode,
+          prefill=prefill,
+          prefill_lengths=prefill_lengths)
+    # Note: We don't use `activation_partitioning.with_sharding_migration` here
+    # because we do often want this 2D sharded. However, if rules are valid,
+    # they should result in 2D sharding. We don't need to raise errors if both
+    # result in 2D sharding (which with_sharding_migration does).
+    if flax_partitioning.get_axis_rules():
+      query = flax_partitioning.with_sharding_constraint(
+          query, ('batch', 'length', 'heads', 'kv'))
+    else:
+      query = activation_partitioning.with_sharding(query, 2)
 
     if prefill and decode:
       raise ValueError('prefill and decode cannot both be true at the same'
@@ -1362,7 +1447,7 @@ class MultiQueryDotProductAttention(nn.Module, DenseAttention):
           use_bias=self.use_bias,
           dtype=self.dtype,
           precision=self.precision,
-          kernel_axis_names=['heads', 'head_dim', 'embed'],
+          kernel_axis_names=['heads', 'kv', 'embed'],
           reshape_kernel=not self.split_head_kernel,
           name='out')(  # pytype: disable=wrong-arg-types
               x)
@@ -1437,19 +1522,21 @@ class LocalAttentionLayer(nn.Module, DenseAttention):
       enable_dropout: Enables dropout if set to True.
 
     Returns:
-      <float>[batch_sizes..., q_len, num_heads, head_dim].
+      An array with the same shape as would be expected from calling
+      `localized_attention` directly.
     """
     chex.assert_shape(inputs_q, (..., None, None))
     num_batch_dims = inputs_q.ndim - 2
     batch_sizes = inputs_q.shape[:num_batch_dims]
-    chex.assert_shape(inputs_kv, batch_sizes + (None, None))
+    chex.assert_shape(inputs_kv, (*batch_sizes, None, None))
     q_len, _ = inputs_q.shape[num_batch_dims:]
     kv_len, _ = inputs_kv.shape[num_batch_dims:]
     if mask is not None:
-      chex.assert_shape(mask, batch_sizes + (None, q_len, kv_len))
-
+      chex.assert_shape(mask, (*batch_sizes, None, q_len, kv_len))
     if bias is not None:
-      raise ValueError(f'{type(self).__name__} does not support `bias`')
+      chex.assert_shape(bias,
+                        (*({b, 1} for b in batch_sizes), None, q_len, kv_len))
+
     if decode:
       raise ValueError(f'{type(self).__name__} does not support decoding mode')
 
@@ -1494,11 +1581,16 @@ class LocalAttentionLayer(nn.Module, DenseAttention):
       inputs_kv_chunk = inputs_kv[..., kv_start:kv_end, :]
       if mask is not None:
         mask_chunk = mask[..., q_start:q_end, kv_start:kv_end]
+      if bias is not None:
+        bias_chunk = bias[..., q_start:q_end, kv_start:kv_end]
 
       if self.always_attend_to_first_position:
         if mask is not None:
           cls_mask = mask[..., q_start:q_end, 0:1]
           mask_chunk = jnp.concatenate([cls_mask, mask_chunk], axis=-1)
+        if bias is not None:
+          cls_bias = bias[..., q_start:q_end, 0:1]
+          bias_chunk = jnp.concatenate([cls_bias, bias_chunk], axis=-1)
 
         kv_cls = inputs_kv[..., 0:1, :]
         inputs_kv_chunk = jnp.concatenate([kv_cls, inputs_kv_chunk], axis=-2)
@@ -1507,9 +1599,14 @@ class LocalAttentionLayer(nn.Module, DenseAttention):
           inputs_q=inputs_q_chunk,
           inputs_kv=inputs_kv_chunk,
           mask=mask_chunk if mask is not None else None,
+          bias=bias_chunk if bias is not None else None,
           enable_dropout=enable_dropout)
+      chex.assert_shape(attention_output_chunk,
+                        (*inputs_q_chunk.shape[:-1], ...))
       attention_output_chunks.append(attention_output_chunk)
-    return jnp.concatenate(attention_output_chunks, axis=-3)
+
+    # Concatenate along the length dim (which directly follows the batch dims).
+    return jnp.concatenate(attention_output_chunks, axis=num_batch_dims)
 
 
 #------------------------------------------------------------------------------

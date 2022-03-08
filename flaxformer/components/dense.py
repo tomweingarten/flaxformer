@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC.
+# Copyright 2022 Google LLC.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,19 +18,24 @@
 
 import functools
 import operator
-from typing import Any, Callable, Iterable, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
 from flax import linen as nn
+from flax.core import frozen_dict
+from flax.linen import partitioning
 from flax.linen.linear import default_kernel_init
 from jax import lax
 import jax.numpy as jnp
 import numpy as np
 
 from flaxformer import activation_partitioning
-from flaxformer import sharding
 from flaxformer.types import Array
 from flaxformer.types import DType
 from flaxformer.types import Initializer
+
+from aqt import flax_layers as aqt_flax_layers
+from aqt import quant_config as aqt_config
+from aqt import quantization as aqt
 
 
 #------------------------------------------------------------------------------
@@ -46,6 +51,13 @@ def _canonicalize_tuple(x):
     return tuple(x)
   else:
     return (x,)
+
+
+# The Flaxformer sharding API emits some names that are too detailed, so we
+# remap them here. Any values that don't match keys here are unchanged.
+_RESHAPED_KERNEL_AXIS_NAME_MAP = frozen_dict.freeze({
+    'heads * kv': 'joined_kv',
+})
 
 
 class DenseGeneral(nn.Module):
@@ -64,6 +76,10 @@ class DenseGeneral(nn.Module):
         for details.
       kernel_axis_names: logical axis names to use for kernel sharding. Each
         should be one of _VALID_AXIS_NAMES in sharding.py.
+      reshaped_kernel_axis_name_map: Rules for renaming fused kernel axes. We
+        keep this as a separate parameter than kernel_axis_names so that
+        experiments can toggle `reshape_kernel` without having to keep
+        `kernel_axis_names` in sync.
       reshape_kernel: whether to reshape the kernel parameter to 2D for
         Adafactor.
   """
@@ -75,6 +91,8 @@ class DenseGeneral(nn.Module):
   bias_init: Initializer = nn.initializers.zeros
   precision: Any = None
   kernel_axis_names: Optional[Sequence[str]] = None
+  reshaped_kernel_axis_name_map: Mapping[str, str] = (
+      _RESHAPED_KERNEL_AXIS_NAME_MAP)
   reshape_kernel: bool = True
 
   @nn.compact
@@ -99,10 +117,8 @@ class DenseGeneral(nn.Module):
                             np.prod(features))
     else:
       kernel_param_shape = kernel_shape
-    kernel = self.param('kernel', self.kernel_init, kernel_param_shape,
-                        jnp.float32)
 
-    # Sow axis names as metadata for partitioning/adafactor rules.
+    # Determine axes names metadata for partitioning/adafactor rules.
     if self.kernel_axis_names is None:
       kernel_axis_names = ['unmodeled'] * len(kernel_param_shape)
     else:
@@ -111,13 +127,22 @@ class DenseGeneral(nn.Module):
         raise ValueError(f"Kernel axis names {kernel_axis_names} doesn't match "
                          f'kernel shape {kernel_shape}.')
       if self.reshape_kernel:
-        kernel_axis_names = (' * '.join(kernel_axis_names[:len(axis)]),
-                             ' * '.join(kernel_axis_names[len(axis):]))
-    self.sow(
-        'param_axes',
-        'kernel_axes',
-        sharding.axis_names(*kernel_axis_names),
-        reduce_fn=sharding.reduce_fn)
+
+        def _reshaped_axis_names(names):
+          result = ' * '.join(names)
+          return self.reshaped_kernel_axis_name_map.get(result, result)
+
+        kernel_axis_names = (
+            _reshaped_axis_names(kernel_axis_names[:len(axis)]),
+            _reshaped_axis_names(kernel_axis_names[len(axis):]),
+        )
+
+    kernel = partitioning.param_with_axes(
+        'kernel',
+        self.kernel_init,
+        kernel_param_shape,
+        jnp.float32,
+        axes=tuple(kernel_axis_names))
 
     kernel = jnp.asarray(kernel, self.dtype)
     kernel = jnp.reshape(kernel, kernel_shape)
@@ -128,13 +153,11 @@ class DenseGeneral(nn.Module):
         kernel, ((axis, contract_ind), ((), ())),
         precision=self.precision)
     if self.use_bias:
-      bias = self.param('bias', self.bias_init, (np.prod(features),),
-                        jnp.float32)
-      self.sow(
-          'param_axes',
-          'bias_axes',
-          sharding.axis_names(kernel_axis_names[-1]),
-          reduce_fn=sharding.reduce_fn)
+      bias = partitioning.param_with_axes(
+          'bias',
+          self.bias_init, (np.prod(features),),
+          jnp.float32,
+          axes=(kernel_axis_names[-1],))
       bias = jnp.asarray(bias, self.dtype)
       bias = jnp.reshape(bias, features)
       # Reshape bias for broadcast.
@@ -169,31 +192,52 @@ class MlpBlock(nn.Module):
     activations: Type of activations for each layer.  Each element is either
       'linear', a string function name in flax.linen, or a function.
     kernel_init: Kernel function, passed to the dense layers.
+    wi_fused_kernel_init: Optional wi_fused kernel function, passed to the
+      dense layers. If None, then kernel_init will be passed instead.
     bias_init: Bias initializer.
     enable_dropout: Enables non-deterministic dropout when set to True.
     intermediate_dropout_rate: Dropout rate used after the intermediate layers.
     final_dropout_rate: Dropout rate used after the final layer.
+    intermediate_dropout: Optional Dropout layer used after the intermediate
+      layers.
+    final_dropout: Optional Dropout layer used after the final layer.
     dtype: Type for the dense layer.
     out_dim: Final dimension of the output. If not set, it will be the same as
-      the input dimenion.
+      the input dimension.
     intermediate_conv: Optional module applied to the first factor of the
       intermediate layer, after activation.
     precomputed_intermediates: whether we're using outside W_i and W_o
       computations, merely using this layer for intermediate computations.
     fuse_kernels: whether to fuse the kernels for gated activation.
+    kernel_axis_names: A triple of axis names for the input, intermediate, and
+      output activations.
+    activation_partitioning_dims: Activation partition for the intermediate
+      activations.
+    weight_params: Parameters for weight quantization.
+    act_params: Parameters for activation quantization.
   """
   use_bias: bool
   intermediate_dim: int = 2048
   activations: Sequence[Union[str, Callable]] = ('relu',)
   kernel_init: Callable = nn.initializers.xavier_uniform()
+  wi_fused_kernel_init: Optional[Callable] = None
   bias_init: Callable = nn.initializers.normal(stddev=1e-6)
   intermediate_dropout_rate: float = 0.1
   final_dropout_rate: float = 0.1
+  intermediate_dropout: Optional[nn.Module] = None
+  final_dropout: Optional[nn.Module] = None
   dtype: Any = jnp.float32
   out_dim: Optional[int] = None
   intermediate_conv: Optional[nn.Module] = None
   precomputed_intermediates: bool = False
   fuse_kernels: bool = False
+  input_axis_name: str = 'embed'
+  activations_axis_name: str = 'mlp_activations'
+  intermediate_axis_name: str = 'mlp'
+  output_axis_name: str = 'embed'
+  activation_partitioning_dims: Optional[int] = 2
+  weight_params: Optional[aqt.QuantOps.WeightParams] = None
+  act_params: Optional[aqt.QuantOps.ActHParams] = None
 
   @nn.compact
   def __call__(self,
@@ -204,11 +248,59 @@ class MlpBlock(nn.Module):
                *,
                enable_dropout: bool = True):
     """Applies Transformer MlpBlock module."""
+    wi_fused_kernel_init = (
+        self.wi_fused_kernel_init
+        if self.wi_fused_kernel_init is not None else self.kernel_init)
+
     actual_out_dim = (
         inputs.shape[-1] if self.out_dim is None else self.out_dim)
 
+    def dense(features, name, inputs, kernel_axis_names):
+      if self.weight_params is not None or self.act_params is not None:
+        # TODO: Push the "quantized vs not" decision down into the
+        # AQT library. Currently we make that decision here, because the AQT
+        # library doesn't support DenseGeneral, so there's extra reshapes here
+        # whose performance impact I don't know.
+        aqt_context = aqt_config.QuantContext(
+            update_bounds=False, collect_acts_stats=False)
+        aqt_hparams = aqt_flax_layers.DenseAqt.HParams(
+            weight_prec=self.weight_params.prec,
+            weight_half_shift=self.weight_params.half_shift,
+            quant_act=self.act_params,  # currently supports fixed bounds only.
+            quant_type=aqt.QuantType.aqt,
+            weight_quant_granularity=aqt_config.QuantGranularity.per_channel,
+        )
+        batch, seq_len, channels = inputs.shape
+        inputs = inputs.reshape((batch * seq_len, channels))
+        result = aqt_flax_layers.DenseAqt(
+            features=features,
+            hparams=aqt_hparams,
+            train=enable_dropout,
+            quant_context=aqt_context,
+            paxis_name=None,
+            # No "cross-replica" reduction expressed in the XLA graph at this
+            # stage. Will be imposed later, automatically, by XLA SPMD.
+            use_bias=self.use_bias,
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init,
+            dtype=self.dtype,
+            kernel_axis_names=kernel_axis_names,
+            name=name,
+        )(inputs, padding_mask=None)
+        return result.reshape((batch, seq_len, features))
+      else:
+        return DenseGeneral(
+            features,
+            use_bias=self.use_bias,
+            dtype=self.dtype,
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init,
+            kernel_axis_names=kernel_axis_names,
+            name=name)(
+                inputs)
+
     # Iterate over specified MLP input activation functions.
-    # e.g. ('relu',) or ('linear', 'gelu') for gated-gelu.
+    # e.g. ('relu',) or ('gelu', 'linear') for gated-gelu.
     activations = []
     # TODO: don't bother w/ fusion if only a single input matrix?
     if not self.fuse_kernels:
@@ -225,15 +317,8 @@ class MlpBlock(nn.Module):
       else:
         for idx, act_fn in enumerate(self.activations):
           dense_name = 'wi' if len(self.activations) == 1 else f'wi_{idx}'
-          x = DenseGeneral(
-              self.intermediate_dim,
-              use_bias=self.use_bias,
-              dtype=self.dtype,
-              kernel_init=self.kernel_init,
-              bias_init=self.bias_init,
-              kernel_axis_names=['embed', 'intermediate'],
-              name=dense_name)(
-                  inputs)
+          x = dense(self.intermediate_dim, dense_name, inputs,
+                    (self.input_axis_name, self.intermediate_axis_name))
           x = _convert_to_activation_function(act_fn)(x)
           if idx == 0 and self.intermediate_conv is not None:
             x = self.intermediate_conv(  # pylint: disable=not-callable
@@ -243,6 +328,10 @@ class MlpBlock(nn.Module):
                 prefill_lengths=prefill_lengths)
           activations.append(x)
     else:
+      if self.weight_params is not None or self.act_params is not None:
+        # TODO: need to make quantization work with fused kernels.
+        raise NotImplementedError('Quantization is not supported yet for ',
+                                  'fused kernels.')
       if self.precomputed_intermediates:
         if self.out_dim is None:
           raise ValueError('Must specify mlp out_dim when using precomputed '
@@ -253,10 +342,11 @@ class MlpBlock(nn.Module):
             (len(self.activations), self.intermediate_dim),
             use_bias=self.use_bias,
             dtype=self.dtype,
-            kernel_init=self.kernel_init,
+            kernel_init=wi_fused_kernel_init,
             bias_init=self.bias_init,
             reshape_kernel=False,
-            kernel_axis_names=['embed', 'unmodeled', 'intermediate'],
+            kernel_axis_names=(self.input_axis_name, self.activations_axis_name,
+                               self.intermediate_axis_name),
             name='wi_fused')(
                 inputs)
       for idx, act_fn in enumerate(self.activations):
@@ -273,24 +363,37 @@ class MlpBlock(nn.Module):
     # Take elementwise product of above intermediate activations.
     x = functools.reduce(operator.mul, activations)
     # Apply dropout and final dense output projection.
-    x = nn.Dropout(
-        rate=self.intermediate_dropout_rate, broadcast_dims=(-2,))(
-            x, deterministic=not enable_dropout)  # Broadcast along length.
-    x = activation_partitioning.with_sharding(x, 2)
+    # TODO: Change the `None` branch to not applying dropout
+    # instead of fallback to default dropout.
+    if self.intermediate_dropout:
+      x = self.intermediate_dropout(x, deterministic=not enable_dropout)  # pylint: disable=not-callable
+    else:
+      x = nn.Dropout(
+          rate=self.intermediate_dropout_rate, broadcast_dims=(-2,))(
+              x, deterministic=not enable_dropout)  # Broadcast along length.
+
+    # Note: We don't use `activation_partitioning.with_sharding_migration` here
+    # because we do often want this 2D sharded. However, if rules are valid,
+    # they should result in 2D sharding. We don't need to raise errors if both
+    # result in 2D sharding (which with_sharding_migration does).
+    if partitioning.get_axis_rules():
+      x = partitioning.with_sharding_constraint(x, ('batch', 'length', 'mlp'))
+    else:
+      x = activation_partitioning.with_sharding(
+          x, self.activation_partitioning_dims)
+
     if self.precomputed_intermediates:
       # we fuse W_out and attention 'O' matrix outside.
       output = x
     else:
-      output = DenseGeneral(
-          actual_out_dim,
-          use_bias=self.use_bias,
-          dtype=self.dtype,
-          kernel_init=self.kernel_init,
-          bias_init=self.bias_init,
-          kernel_axis_names=['intermediate', 'embed'],
-          name='wo')(
-              x)
-      output = nn.Dropout(
-          rate=self.final_dropout_rate, broadcast_dims=(-2,))(
-              output, deterministic=not enable_dropout)
+      output = dense(actual_out_dim, 'wo', x,
+                     (self.intermediate_axis_name, self.output_axis_name))
+      # TODO: Change the `None` branch to not applying dropout
+      # instead of fallback to default dropout.
+      if self.final_dropout:
+        output = self.final_dropout(output, deterministic=not enable_dropout)  # pylint: disable=not-callable
+      else:
+        output = nn.Dropout(
+            rate=self.final_dropout_rate, broadcast_dims=(-2,))(
+                output, deterministic=not enable_dropout)
     return output
