@@ -49,12 +49,10 @@ class GinConfigsTest(parameterized.TestCase):
   @parameterized.parameters(
       'experts_choose_small.gin',
       'experts_choose_tiny.gin',
-      'switch_small.gin',
-      'switch_tiny.gin',
       'tokens_choose_small.gin',
       'tokens_choose_tiny.gin',
   )
-  def test_model_gin_config(self, filename):
+  def test_encoder_decoder_model_gin_config(self, filename):
     path = os.path.join(self.root, 'models', filename)
     gin.parse_config_file(path)
     gin.parse_config("""
@@ -96,6 +94,7 @@ class GinConfigsTest(parameterized.TestCase):
         'decoder_loss_weights': decoder_loss_weights
     }
     _ = model.score_batch(variables['params'], batch)
+
 
   def test_architecture_gin_config(self):
     path = os.path.join(self.root, 'architectures', 'moe.gin')
