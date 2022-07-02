@@ -309,7 +309,7 @@ class MultiHeadLinearAttention(nn.Module, LinearAttention):
       features if not provided. If output_projection is False, then output of
       shape `[batch_sizes..., length, qkv_features]`, where qkv_features is set
       to features if not provided.
-    """
+    """    
     validate_linear_attention_call_parameter_shapes(inputs_q, inputs_kv, mask,
                                                    bias, self.num_heads)
     if precomputed_qkv is not None:
@@ -510,7 +510,7 @@ class MultiHeadLinearAttention(nn.Module, LinearAttention):
           rotary_index=rotary_index)
 
     # Compute and apply attention (at the same time).
-    if self.rescale_logits or self.use_extra_logit or self.float32_logits:
+    if self.use_extra_logit or self.float32_logits:
         # TODO: Implement these in FAVOR+ so they can be used here
         raise NotImplementedError
     if enable_dropout and self.dropout_rate > 0.:
@@ -933,7 +933,7 @@ class MultiHeadSparseLinearAttention(MultiHeadLinearAttention):
           rotary_index=rotary_index)
 
     # Compute and apply attention (at the same time).
-    if self.rescale_logits or self.use_extra_logit or self.float32_logits:
+    if self.use_extra_logit or self.float32_logits:
         # TODO: Implement these in FAVOR+ so they can be used here
         raise NotImplementedError
     if enable_dropout and self.dropout_rate > 0.:

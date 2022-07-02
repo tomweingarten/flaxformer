@@ -323,6 +323,8 @@ class EncoderLayer(nn.Module, param_remapping.ParameterRemappable):
         logical_axis_names=('batch', 'length', 'embed'))
     if self.sow_intermediates:
       self.sow('intermediates', 'activations', y)
+    
+    
 
     # scan expects functions to have a signature: fn(carry, in) --> carry, out
     # TODO: automate this detail.

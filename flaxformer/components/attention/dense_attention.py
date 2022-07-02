@@ -653,7 +653,7 @@ class MultiHeadDotProductAttention(nn.Module, DenseAttention):
       features if not provided. If output_projection is False, then output of
       shape `[batch_sizes..., length, num_heads, head_dim]`.
     """
-    validate_dense_attention_call_eter_shapes(inputs_q, inputs_kv, mask,
+    validate_dense_attention_call_parameter_shapes(inputs_q, inputs_kv, mask,
                                                    bias, self.num_heads)
 
     qkv_kernel_init = (
@@ -819,7 +819,7 @@ class MultiHeadDotProductAttention(nn.Module, DenseAttention):
                                    swap_dims(value.shape), value.dtype)
       cache_index = self.variable('cache', 'cache_index',
                                   lambda: jnp.array(0, dtype=jnp.int32))
-      rotary_index = cache_index.value
+      rotary_index = cache_index.value[None]
       if is_initialized:
         # Here we are in "apply()".
         *batch_dims, num_heads, features_per_head, length = (
@@ -1297,7 +1297,7 @@ class MultiQueryDotProductAttention(nn.Module, DenseAttention):
                                    swap_dims(value.shape), value.dtype)
       cache_index = self.variable('cache', 'cache_index',
                                   lambda: jnp.array(0, dtype=jnp.int32))
-      rotary_index = cache_index.value
+      rotary_index = cache_index.value[None]
 
       if is_initialized:
         # Here we are in "apply()".
