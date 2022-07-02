@@ -21,7 +21,7 @@ the original T5 classes (assuming outputs are not that long).
 """
 
 import inspect
-from typing import Callable, Optional, Any
+from typing import Callable, Optional, Any, Tuple
 
 from flax import linen as nn
 import jax.numpy as jnp
@@ -525,10 +525,11 @@ class LongEncoderDecoder(nn.Module, param_remapping.ParameterRemappable):
   # Configures behavior when the model is called. Many of these might eventually
   # be better as call parameters.
   dtype: DType = jnp.float32
-  scan_layers: bool = False  # only used to smuggle this option to predict_fn.
+  scan_layers: bool = False  # only used to pass this option to predict_fn.
   spmd_annotations: Any = None  # only used for scanned spmd layers
 
   shared_token_embedder_factory: Optional[Callable[[], embedding.Embed]] = None
+
 
   def setup(self):
     self.token_embedder = (
@@ -620,12 +621,14 @@ class LongEncoderDecoder(nn.Module, param_remapping.ParameterRemappable):
     Returns:
       logits array from transformer decoder.
     """
+
     # Make padding attention masks.
     if decode:
-      # Fast autoregressive decoding uses only a special encoder-decoder mask.
+      # Do not mask decoder attention based on targets padding at
+      # decoding/inference time.
       decoder_mask = None
       encoder_decoder_mask = dense_attention.make_attention_mask(
-          jnp.ones_like(decoder_target_tokens) > 0,
+          jnp.ones_like(decoder_target_tokens),
           encoder_input_tokens > 0,
           dtype=self.dtype)
     else:
@@ -659,6 +662,7 @@ class LongEncoderDecoder(nn.Module, param_remapping.ParameterRemappable):
         decoder_positions=decoder_positions,
         decoder_mask=decoder_mask,
         encoder_decoder_mask=encoder_decoder_mask,
+        segment_ids=decoder_segment_ids,
         enable_dropout=enable_dropout,
         decode=decode,
         max_decode_length=max_decode_length)
@@ -666,6 +670,10 @@ class LongEncoderDecoder(nn.Module, param_remapping.ParameterRemappable):
   @property
   def encoder_embedder(self) -> embedding.MultiEmbed:
     return self.encoder.embedder
+
+  @property
+  def decoder_embedder(self) -> embedding.MultiEmbed:
+    return self.decoder.embedder
 
   def __call__(self,
                encoder_input_tokens,
@@ -694,7 +702,7 @@ class LongEncoderDecoder(nn.Module, param_remapping.ParameterRemappable):
       decoder_segment_ids: decoder segmentation info for packed examples.
       encoder_positions: encoder subsequence positions for packed examples.
       decoder_positions: decoder subsequence positions for packed examples.
-      enable_dropout: Enables dropout if set to False.
+      enable_dropout: Enables dropout if set to True.
       decode: Whether to prepare and use an autoregressive cache.
       max_decode_length: An optional integer specifying the maximum decoding
         length. Note that this is only used for defining the relative position
@@ -720,3 +728,5 @@ class LongEncoderDecoder(nn.Module, param_remapping.ParameterRemappable):
         enable_dropout=enable_dropout,
         decode=decode,
         max_decode_length=max_decode_length)
+
+

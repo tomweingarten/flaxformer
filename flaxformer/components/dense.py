@@ -209,10 +209,15 @@ class MlpBlock(nn.Module):
     precomputed_intermediates: whether we're using outside W_i and W_o
       computations, merely using this layer for intermediate computations.
     fuse_kernels: whether to fuse the kernels for gated activation.
-    kernel_axis_names: A triple of axis names for the input, intermediate, and
-      output activations.
+    input_axis_name: Axis name for input activations.
+    activations_axis_name: Axis name for intermediate activations.
+    intermediate_axis_name: Axis name for output activations.
+    data_sharding_constraints: Sharding constraint for data. If unspecified
+      (default), sharding constraints are inferred from the data shape; see
+      _get_logical_axes().
     activation_partitioning_dims: Activation partition for the intermediate
       activations.
+    use_aqt: Whether to use aqt quantization.
     weight_params: Parameters for weight quantization.
     act_params: Parameters for activation quantization.
   """
@@ -235,9 +240,12 @@ class MlpBlock(nn.Module):
   activations_axis_name: str = 'mlp_activations'
   intermediate_axis_name: str = 'mlp'
   output_axis_name: str = 'embed'
+  data_sharding_constraints: Optional[Tuple[str, ...]] = None
   activation_partitioning_dims: Optional[int] = 2
+  use_aqt: Optional[bool] = False
   weight_params: Optional[aqt.QuantOps.WeightParams] = None
   act_params: Optional[aqt.QuantOps.ActHParams] = None
+  possibly_use_quantized_vars: bool = False
 
   @nn.compact
   def __call__(self,
@@ -256,27 +264,35 @@ class MlpBlock(nn.Module):
         inputs.shape[-1] if self.out_dim is None else self.out_dim)
 
     def dense(features, name, inputs, kernel_axis_names):
-      if self.weight_params is not None or self.act_params is not None:
+      if self.use_aqt:
+        if self.weight_params is None and self.act_params is None:
+          raise ValueError(
+              'If use_aqt is True, either of weights or acts quantization need '
+              'to be specified using arguments `weight_params` or `act_params`.'
+          )
         # TODO: Push the "quantized vs not" decision down into the
         # AQT library. Currently we make that decision here, because the AQT
         # library doesn't support DenseGeneral, so there's extra reshapes here
         # whose performance impact I don't know.
-        aqt_context = aqt_config.QuantContext(
+        aqt_context = aqt_config.DynamicContext(
             update_bounds=False, collect_acts_stats=False)
+        weight_prec = self.weight_params.prec if self.weight_params else None
+        half_shift = self.weight_params.half_shift if self.weight_params else False
         aqt_hparams = aqt_flax_layers.DenseAqt.HParams(
-            weight_prec=self.weight_params.prec,
-            weight_half_shift=self.weight_params.half_shift,
+            weight_prec=weight_prec,
+            weight_half_shift=half_shift,
             quant_act=self.act_params,  # currently supports fixed bounds only.
             quant_type=aqt.QuantType.AQT,
             weight_quant_granularity=aqt_config.QuantGranularity.PER_CHANNEL,
         )
         batch, seq_len, channels = inputs.shape
         inputs = inputs.reshape((batch * seq_len, channels))
+
         result = aqt_flax_layers.DenseAqt(
             features=features,
             hparams=aqt_hparams,
             train=enable_dropout,
-            quant_context=aqt_context,
+            dynamic_context=aqt_context,
             paxis_name=None,
             # No "cross-replica" reduction expressed in the XLA graph at this
             # stage. Will be imposed later, automatically, by XLA SPMD.
@@ -286,6 +302,7 @@ class MlpBlock(nn.Module):
             dtype=self.dtype,
             kernel_axis_names=kernel_axis_names,
             name=name,
+            possibly_use_quantized_vars=self.possibly_use_quantized_vars,
         )(inputs, padding_mask=None)
         return result.reshape((batch, seq_len, features))
       else:
@@ -377,8 +394,10 @@ class MlpBlock(nn.Module):
     # they should result in 2D sharding. We don't need to raise errors if both
     # result in 2D sharding (which with_sharding_migration does).
     if partitioning.get_axis_rules():
+      logical_axis_resources = (
+          self.data_sharding_constraints or _get_logical_axes(x))
       x = partitioning.with_sharding_constraint(
-          x, logical_axis_resources=_get_logical_axes(x))
+          x, logical_axis_resources=logical_axis_resources)
     else:
       x = activation_partitioning.with_sharding(
           x, self.activation_partitioning_dims)

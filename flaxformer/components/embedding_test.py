@@ -96,6 +96,31 @@ class EmbedTest(parameterized.TestCase):
       embed.init(
           jax.random.PRNGKey(0), inputs, input_axis_names=('my_batch_dim',))
 
+  def test_embedding_axis_names_ctor(self):
+    rules = [
+        ('my_batch_dim', 'data'),
+        ('embed', None),
+        ('vocab', None),
+    ]
+    with flax_partitioning.axis_rules(rules):
+      embed = embedding.Embed(
+          num_embeddings=10, features=5, input_axis_names=('my_batch_dim',))
+      inputs = np.array([1], dtype=np.int64)
+      embed.init(jax.random.PRNGKey(0), inputs)
+
+  def test_embedding_axis_names_call_overrides(self):
+    rules = [
+        ('my_batch_dim', 'data'),
+        ('embed', None),
+        ('vocab', None),
+    ]
+    with flax_partitioning.axis_rules(rules):
+      embed = embedding.Embed(
+          num_embeddings=10, features=5, input_axis_names=('other_batch_dim',))
+      inputs = np.array([1], dtype=np.int64)
+      embed.init(
+          jax.random.PRNGKey(0), inputs, input_axis_names=('my_batch_dim',))
+
 
 class MultiEmbedTest(parameterized.TestCase):
 
@@ -367,45 +392,41 @@ class EmbeddingTest(parameterized.TestCase):
         'pos_embedding': (32, 5),
     })
     np.testing.assert_allclose(
-        outputs, [
-            [
-                [
-                    6.417410531867063e-07, -9.799798306175944e-08,
-                    5.555829716286098e-07, -1.6317341078320169e-06,
-                    -3.149363578813791e-07
-                ],
-                [
-                    1.046715851771296e-06, 1.139310299436147e-07,
-                    1.0767863045657577e-07, -1.2913797036162578e-06,
-                    -5.156626912139473e-07
-                ],
-                [
-                    1.3656243709192495e-06, -1.7889256014314014e-06,
-                    5.730560133088147e-07, -1.1404511042201193e-06,
-                    6.165008699099417e-07
-                ],
-                [
-                    -2.014825213336735e-07, -6.456507435359526e-07,
-                    -3.109490762653877e-07, -7.383717814946067e-08,
-                    -1.905724502648809e-06
-                ],
-                [
-                    1.604741726168868e-07, 7.540054411947494e-07,
-                    5.639509481625282e-07, -1.6647313714202028e-06,
-                    9.162973242382577e-07
-                ],
-                [
-                    2.2114620890079095e-07, -1.906814873109397e-06,
-                    -1.786764187272638e-06, -2.2142488376175606e-07,
-                    -1.5123981711440138e-06
-                ],
-                [
-                    -2.9822021474501526e-07, 2.7386813599150628e-06,
-                    -2.150136197087704e-06, 2.099384346365696e-06,
-                    4.0360737330047414e-07
-                ],
-            ],
+        outputs, [[[
+            4.486782358981145e-07, -3.5457077274259063e-07,
+            1.0727929122822388e-07, 1.3890753791656607e-07,
+            -7.792502287884417e-07
         ],
+                   [
+                       -2.3853303332543874e-07, 8.467901011499634e-07,
+                       -8.650059157844225e-08, 3.407756707929366e-07,
+                       -2.226069852895307e-07
+                   ],
+                   [
+                       -1.1156219414942825e-07, -6.10807489920262e-07,
+                       1.5079198192324839e-06, 1.714607265057566e-07,
+                       -1.9881858861481305e-06
+                   ],
+                   [
+                       2.980690965159738e-07, 4.950079102172822e-08,
+                       1.9940485174174682e-07, 7.134963198041078e-07,
+                       1.5179145975707797e-06
+                   ],
+                   [
+                       7.398467261054975e-08, -4.966278197571228e-07,
+                       8.895806757891478e-08, -4.5914887891740364e-07,
+                       1.1332289204801782e-06
+                   ],
+                   [
+                       1.3519083950086497e-06, -1.0249741535517387e-06,
+                       -1.1988712458332884e-06, -6.748282288526752e-08,
+                       1.18359389489342e-06
+                   ],
+                   [
+                       -1.6119436168082757e-06, 1.0756450308235799e-07,
+                       -8.505542155035073e-07, 1.1778743100876454e-06,
+                       -1.000783186100307e-06
+                   ]]],
         rtol=1e-5)
 
 
@@ -552,6 +573,62 @@ class NgramHashEmbedTest(parameterized.TestCase):
     # Verify that the change to segment=1 didn't alter the outputs of segment=0.
     np.testing.assert_allclose(outputs1[..., :5, :], outputs2[..., :5, :])
 
+
+class RotaryTest(absltest.TestCase):
+
+  def test_rotary_embedding(self):
+    """Checks the shape of rotary encodings."""
+    batch = 2
+    qlen = 3
+    qheads = 4
+    d = 2 * 5
+    klen = 6
+    kheads = 7
+    maxlen = 8
+
+    q = np.ones((batch, qlen, qheads, d))
+    k = np.ones((batch, klen, kheads, d))
+    cos = np.ones((maxlen, d))
+    sin = np.ones((maxlen, d))
+    out_q, out_k = embedding.apply_rotary_embedding(q, k, cos, sin)
+    self.assertEqual(out_q.shape, q.shape)
+    self.assertEqual(out_k.shape, k.shape)
+
+  def test_rotary_embedding_multiquery(self):
+    """Checks the shape of rotary encodings."""
+    batch = 2
+    qlen = 3
+    qheads = 4
+    d = 2 * 5
+    klen = 6
+    maxlen = 8
+
+    q = np.ones((batch, qlen, qheads, d))
+    k = np.ones((batch, klen, d))
+    cos = np.ones((maxlen, d))
+    sin = np.ones((maxlen, d))
+    out_q, out_k = embedding.apply_rotary_embedding(q, k, cos, sin)
+    self.assertEqual(out_q.shape, q.shape)
+    self.assertEqual(out_k.shape, k.shape)
+
+  def test_rotary_embedding_decode(self):
+    """Checks the shape of rotary encodings."""
+    batch = 2
+    qlen = 1
+    qheads = 4
+    d = 2 * 5
+    klen = 6
+    maxlen = 8
+
+    q = np.ones((batch, qlen, qheads, d))
+    k = np.ones((batch, klen, d))
+    cos = np.ones((maxlen, d))
+    sin = np.ones((maxlen, d))
+    rotary_index = np.ones((batch,), dtype=np.int32)
+    out_q, out_k = embedding.apply_rotary_embedding(
+        q, k, cos, sin, decode=True, rotary_index=rotary_index)
+    self.assertEqual(out_q.shape, q.shape)
+    self.assertEqual(out_k.shape, k.shape)
 
 if __name__ == '__main__':
   absltest.main()

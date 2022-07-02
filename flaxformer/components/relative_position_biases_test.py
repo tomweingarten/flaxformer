@@ -21,7 +21,12 @@ from jax import random
 import jax.numpy as jnp
 import numpy as np
 
+from flaxformer import sharding
+from flaxformer import testing_utils
 from flaxformer.components import relative_position_biases
+
+expected_files = testing_utils.ExpectedJsonFiles(
+    'flaxformer/components/testdata')
 
 
 class RelativePositionBiasesTest(absltest.TestCase):
@@ -37,6 +42,24 @@ class RelativePositionBiasesTest(absltest.TestCase):
         dtype=jnp.float32,
     )
     super().setUp()
+
+  def test_relative_attention_renamed_head_axis(self):
+    """Tests that the head axis renaming is as expected."""
+    self.relative_attention = relative_position_biases.RelativePositionBiases(
+        num_buckets=12,
+        max_distance=10,
+        num_heads=3,
+        dtype=jnp.float32,
+        head_axis_name='relpos_heads')
+    variables = self.relative_attention.init(
+        random.PRNGKey(0), self.query_len, self.key_len)
+    sharding.check_params_and_axis_names_match(variables)
+    for axis_names in jax.tree_leaves(sharding.get_axis_names(variables)):
+      for axis_name in axis_names:
+        self.assertIn(axis_name, {'relpos_heads', 'relpos_buckets'})
+    expected_files.check_params_and_axes(variables['params'],
+                                         variables['params_axes'],
+                                         'relpos_bias_renamed_head_axis.json')
 
   def test_relative_attention_bidirectional_params(self):
     """Tests that bidirectional relative position biases have expected params."""
@@ -60,10 +83,10 @@ class RelativePositionBiasesTest(absltest.TestCase):
         random.PRNGKey(0), self.query_len, self.key_len, bidirectional=True)
     self.assertEqual(outputs.shape,
                      (1, self.num_heads, self.query_len, self.key_len))
-    self.assertAlmostEqual(outputs[0, 0, 0, 0], 0.55764728, places=5)
-    self.assertAlmostEqual(outputs[0, 1, 2, 1], -0.10935841, places=5)
-    self.assertAlmostEqual(outputs[0, 1, 4, 6], 0.14510104, places=5)
-    self.assertAlmostEqual(outputs[0, 2, 4, 6], -0.36783996, places=5)
+    self.assertAlmostEqual(outputs[0, 0, 0, 0], -0.10940, places=5)
+    self.assertAlmostEqual(outputs[0, 1, 2, 1], -0.22087, places=5)
+    self.assertAlmostEqual(outputs[0, 1, 4, 6], 0.27360, places=5)
+    self.assertAlmostEqual(outputs[0, 2, 4, 6], -0.31798, places=5)
 
   def test_relative_attention_unidirectional_params(self):
     """Tests that unidirectional relative position biases have expected params."""
@@ -88,10 +111,11 @@ class RelativePositionBiasesTest(absltest.TestCase):
         random.PRNGKey(0), self.query_len, self.key_len, bidirectional=False)
     self.assertEqual(outputs.shape,
                      (1, self.num_heads, self.query_len, self.key_len))
-    self.assertAlmostEqual(outputs[0, 0, 0, 0], 0.55764728, places=5)
-    self.assertAlmostEqual(outputs[0, 1, 2, 1], -0.10935841, places=5)
-    self.assertAlmostEqual(outputs[0, 1, 4, 6], -0.13101986, places=5)
-    self.assertAlmostEqual(outputs[0, 2, 4, 6], 0.39296466, places=5)
+
+    self.assertAlmostEqual(outputs[0, 0, 0, 0], -0.10940, places=5)
+    self.assertAlmostEqual(outputs[0, 1, 2, 1], -0.22087, places=5)
+    self.assertAlmostEqual(outputs[0, 1, 4, 6], -0.18996, places=5)
+    self.assertAlmostEqual(outputs[0, 2, 4, 6], 0.3660492, places=5)
 
   def test_relative_attention_decode_cache_error_with_init(self):
     """Tests that relative embedding init fails with decode == True."""
@@ -155,10 +179,10 @@ class RelativePositionBiasesTest(absltest.TestCase):
 
     cached_bias = state['cache']['cached_bias']
 
-    self.assertAlmostEqual(cached_bias[0, 0, 0, 0], 0.55764728, places=5)
-    self.assertAlmostEqual(cached_bias[0, 1, 2, 1], -0.10935841, places=5)
-    self.assertAlmostEqual(cached_bias[0, 1, 4, 6], -0.13101986, places=5)
-    self.assertAlmostEqual(cached_bias[0, 2, 4, 6], 0.39296466, places=5)
+    self.assertAlmostEqual(outputs[0, 0, 0, 0], -0.10940, places=5)
+    self.assertAlmostEqual(outputs[0, 1, 2, 1], -0.22087, places=5)
+    self.assertAlmostEqual(outputs[0, 1, 4, 6], -0.18996, places=5)
+    self.assertAlmostEqual(outputs[0, 2, 4, 6], 0.3660492, places=5)
 
     np.testing.assert_array_equal(outputs, state['cache']['cached_bias'])
 

@@ -51,7 +51,17 @@ as needed!
 
 # Installing dependencies and running tests
 
-After checking out this repository, in its root directory, you can install it
+First, we recommend installing a few dependencies manually,
+
+```
+pip3 install numpy sentencepiece tensorflow==2.8.1
+```
+
+This is a workaround to prevent pip backtracking on package versions; we
+believe there is either a version conflict in upstream packages, or pip's
+constraint solving process is imperfect.
+
+Then, check out this repository. In its root directory, you can install it
 along with test dependencies by running,
 
 ```
@@ -61,11 +71,8 @@ pip3 install '.[testing]'
 If you like, you can run the tests from pytest with the following invocation,
 
 ```
-export FLAX_LAZY_RNG=no; python3 -m pytest
+python3 -m pytest
 ```
-
-(`export FLAX_LAZY_RNG=no` is a workaround for recent Flax RNG changes, and
-future versions of Flaxformer will not require it.)
 
 ## Uninstalling
 

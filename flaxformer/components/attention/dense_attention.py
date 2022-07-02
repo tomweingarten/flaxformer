@@ -20,9 +20,12 @@ import abc
 import functools
 from typing import Callable, Optional, Tuple, Union
 
+from aqt.jax_legacy.jax import flax_layers as aqt_flax_layers
+from aqt.jax_legacy.jax import quant_config as aqt_config
+from aqt.jax_legacy.jax import quantization as aqt
 import chex
 from flax import linen as nn
-import flax.core.variables as variables
+from flax.core import variables
 from flax.linen import initializers
 from flax.linen import partitioning as flax_partitioning
 from flax.linen.linear import default_kernel_init
@@ -39,6 +42,9 @@ from flaxformer.types import Array
 from flaxformer.types import DType
 from flaxformer.types import Initializer
 from flaxformer.types import PRNGKey
+
+
+RulesFallback = flax_partitioning.RulesFallback
 
 
 def _softmax_with_extra_logit(
@@ -927,14 +933,7 @@ class MultiHeadDotProductAttention(nn.Module, DenseAttention):
       sin, cos = embedding.generate_fixed_pos_embedding(
           dim, max_length, max_timescale=self.rotary_embedding_max_timescale)
       query, key = embedding.apply_rotary_embedding(
-          query,
-          key,
-          cos,
-          sin,
-          batch_size=inputs_q.shape[0],
-          num_heads=self.num_heads,
-          decode=decode,
-          rotary_index=rotary_index)
+          query, key, cos, sin, decode=decode, rotary_index=rotary_index)
 
     # Compute attention.
     attn_weights = self.compute_attention_fn(
@@ -1009,6 +1008,9 @@ class MultiQueryDotProductAttention(nn.Module, DenseAttention):
     float32_logits: bool, if True then compute logits in float32 to avoid
       numerical issues with bfloat16.
     use_rotary_embedding: whether to use RoPE embeddings.
+    use_aqt: whether to use aqt quantization.
+    weight_params: Parameters for weight quantization.
+    act_params: Parameters for acitvation quantization.
   """
   num_heads: int
   use_bias: bool
@@ -1033,6 +1035,10 @@ class MultiQueryDotProductAttention(nn.Module, DenseAttention):
   q_conv: Optional[nn.Module] = None
   k_conv: Optional[nn.Module] = None
   v_conv: Optional[nn.Module] = None
+  use_aqt: Optional[bool] = False
+  weight_params: Optional[aqt.QuantOps.WeightParams] = None
+  act_params: Optional[aqt.QuantOps.ActHParams] = None
+  possibly_use_quantized_vars: bool = False
 
   def update_cache_prefill(
       self, key: Array, value: Array, cached_key: variables.Variable,
@@ -1111,8 +1117,7 @@ class MultiQueryDotProductAttention(nn.Module, DenseAttention):
       cached_value: The cache of previous values. [batch..., features_per_head,
         length]
       cache_index: The timestep that we are currently calculating the key and
-        value for. [batch] if we are decoding after doing a prefill or [1] if we
-        are starting with step-by-step decoding.
+        value for. [batch]
 
     Returns:
       The key, value, and the last timestep we just filled in the cache. Note:
@@ -1209,37 +1214,96 @@ class MultiQueryDotProductAttention(nn.Module, DenseAttention):
       depth_scaling = jnp.sqrt(head_dim).astype(self.dtype)
       query_init = lambda *args: q_kernel_init(*args) / depth_scaling
 
-    dense_query = functools.partial(
-        dense.DenseGeneral,
-        axis=-1,
-        features=(self.num_heads, head_dim),
-        bias_init=self.bias_init,
-        use_bias=self.use_bias,
-        dtype=self.dtype,
-        kernel_init=query_init,
-        precision=self.precision,
-        kernel_axis_names=['embed', 'heads', 'kv'],
-        reshape_kernel=not self.split_head_kernel)
-
-    dense_kv = functools.partial(
-        dense.DenseGeneral,
-        axis=-1,
-        features=head_dim,
-        bias_init=self.bias_init,
-        use_bias=self.use_bias,
-        dtype=self.dtype,
-        kernel_init=self.kernel_init,
-        precision=self.precision,
-        kernel_axis_names=['embed', 'kv'],
-    )
+    def dense_output(
+        features,
+        axis,
+        kernel_init,
+        kernel_axis_names,
+        name,
+        inputs,
+        reshape_kernel=True,
+    ):
+      if self.use_aqt:
+        if self.weight_params is None and self.act_params is None:
+          raise ValueError(
+              'If use_aqt is True, either of weights or acts quantization need '
+              'to be specified using arguments `weight_params` or `act_params`.'
+          )
+        # TODO: Push the "quantized vs not" decision down into
+        # the AQT library. Currently we make that decision here, because the AQT
+        # library doesn't support DenseGeneral.
+        aqt_context = aqt_config.DynamicContext(
+            update_bounds=False, collect_acts_stats=False)
+        weight_prec = self.weight_params.prec if self.weight_params else None
+        half_shift = self.weight_params.half_shift if self.weight_params else False
+        aqt_hparams = aqt_flax_layers.DenseAqt.HParams(
+            weight_prec=weight_prec,
+            weight_half_shift=half_shift,
+            quant_act=self.act_params,  # currently supports fixed bounds only.
+            quant_type=aqt.QuantType.AQT,
+            weight_quant_granularity=aqt_config.QuantGranularity.PER_CHANNEL,
+        )
+        return aqt_flax_layers.DenseAqt(
+            features=features,
+            hparams=aqt_hparams,
+            train=enable_dropout,
+            dynamic_context=aqt_context,
+            paxis_name=None,
+            # No "cross-replica" reduction expressed in the XLA graph at this
+            # stage. Will be imposed later, automatically, by XLA SPMD.
+            use_bias=self.use_bias,
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init,
+            dtype=self.dtype,
+            kernel_axis_names=kernel_axis_names,
+            # we do not have reshape kernel option here but we explicitly
+            # reshape kernel.
+            precision=self.precision,
+            possibly_use_quantized_vars=self.possibly_use_quantized_vars,
+            name=name,
+        )(inputs, padding_mask=None)
+      else:
+        return dense.DenseGeneral(
+            axis=axis,
+            features=features,
+            bias_init=self.bias_init,
+            use_bias=self.use_bias,
+            dtype=self.dtype,
+            kernel_init=kernel_init,
+            precision=self.precision,
+            kernel_axis_names=kernel_axis_names,
+            reshape_kernel=reshape_kernel,
+            name=name)(
+                inputs)
 
     # Project inputs_q to multi-headed q and single-headed k and v
     # query dimension is then [batch..., length, num_heads, features_per_head]
     # key and value dimensions are [batch..., length, features_per_head].
     if precomputed_qkv is None:
-      query = dense_query(name='query')(inputs_q)
-      key = dense_kv(name='key')(inputs_kv)
-      value = dense_kv(name='value')(inputs_kv)
+      query = dense_output(
+          features=(self.num_heads, head_dim),
+          axis=-1,
+          kernel_init=query_init,
+          kernel_axis_names=['embed', 'heads', 'kv'],
+          name='query',
+          inputs=inputs_q,
+          reshape_kernel=not self.split_head_kernel,
+      )
+
+      key = dense_output(
+          features=head_dim,
+          axis=-1,
+          kernel_init=self.kernel_init,
+          kernel_axis_names=['embed', 'kv'],
+          name='key',
+          inputs=inputs_kv)
+      value = dense_output(
+          features=head_dim,
+          axis=-1,
+          kernel_init=self.kernel_init,
+          kernel_axis_names=['embed', 'kv'],
+          name='value',
+          inputs=inputs_kv)
     else:
       query, key, value = precomputed_qkv
 
@@ -1262,6 +1326,13 @@ class MultiQueryDotProductAttention(nn.Module, DenseAttention):
           decode=decode,
           prefill=prefill,
           prefill_lengths=prefill_lengths)
+
+    sharding_prefix = 'attn_decode' if decode else 'attn_encode'
+
+    bias_sharding = (f'{sharding_prefix}_batch', f'{sharding_prefix}_heads',
+                     f'{sharding_prefix}_q_length',
+                     f'{sharding_prefix}_kv_length')
+
     # Note: We don't use `activation_partitioning.with_sharding_migration` here
     # because we do often want this 2D sharded. However, if rules are valid,
     # they should result in 2D sharding. We don't need to raise errors if both
@@ -1366,6 +1437,11 @@ class MultiQueryDotProductAttention(nn.Module, DenseAttention):
                   jnp.arange(length),
                   tuple(batch_dims) +
                   (1, 1, length)) <= jnp.reshape(cur_index, (-1, 1, 1, 1)))
+
+          mask = flax_partitioning.with_sharding_constraint(
+              mask, (f'{sharding_prefix}_batch', None, None, None),
+              fallback=RulesFallback.NO_CONSTRAINT)
+
           # Grab the correct relative attention bias during decoding.
           if bias is not None:
             # The bias is a full attention matrix, but during decoding we only
@@ -1382,6 +1458,8 @@ class MultiQueryDotProductAttention(nn.Module, DenseAttention):
                 'bq, bhqk->bhk',
                 common_utils.onehot(cur_index, num_classes=length), bias)
             bias = jnp.expand_dims(bias, 2)
+            bias = flax_partitioning.with_sharding_constraint(
+                bias, bias_sharding, fallback=RulesFallback.NO_CONSTRAINT)
 
         # Currently, updating a variable inside of a method is not handled
         # in flax, so we return the actual values and assign them in the main
@@ -1400,16 +1478,35 @@ class MultiQueryDotProductAttention(nn.Module, DenseAttention):
           mask > 0,
           jnp.full(mask.shape, 0.).astype(self.dtype),
           jnp.full(mask.shape, -1e10).astype(self.dtype))
+      attention_bias = flax_partitioning.with_sharding_constraint(
+          attention_bias, bias_sharding, fallback=RulesFallback.NO_CONSTRAINT)
     else:
       attention_bias = None
 
     # Add provided bias term (e.g. relative position embedding).
     if bias is not None:
       attention_bias = combine_biases(attention_bias, bias)
+      attention_bias = flax_partitioning.with_sharding_constraint(
+          attention_bias, bias_sharding, fallback=RulesFallback.NO_CONSTRAINT)
 
     dropout_rng = None
     if enable_dropout and self.dropout_rate > 0.:
       dropout_rng = self.make_rng('dropout')
+
+    # During decode we typically want to reshard at this point from sharding by
+    # by head to sharding by batch. Give new names to the sharding axes to allow
+    # this reshard.
+    query = flax_partitioning.with_sharding_constraint(
+        query, (f'{sharding_prefix}_batch', f'{sharding_prefix}_q_length',
+                f'{sharding_prefix}_heads', 'kv'),
+        fallback=RulesFallback.NO_CONSTRAINT)
+    key = flax_partitioning.with_sharding_constraint(
+        key, (f'{sharding_prefix}_batch', f'{sharding_prefix}_kv_length', 'kv'),
+        fallback=RulesFallback.NO_CONSTRAINT)
+    value = flax_partitioning.with_sharding_constraint(
+        value,
+        (f'{sharding_prefix}_batch', f'{sharding_prefix}_kv_length', 'kv'),
+        fallback=RulesFallback.NO_CONSTRAINT)
 
     if self.use_rotary_embedding:
       # use rotary embeddings before attention
@@ -1420,14 +1517,7 @@ class MultiQueryDotProductAttention(nn.Module, DenseAttention):
       sin, cos = embedding.generate_fixed_pos_embedding(
           dim, max_length, max_timescale=self.rotary_embedding_max_timescale)
       query, key = embedding.apply_rotary_embedding(
-          query,
-          key,
-          cos,
-          sin,
-          batch_size=inputs_q.shape[0],
-          num_heads=self.num_heads,
-          decode=decode,
-          rotary_index=rotary_index)
+          query, key, cos, sin, decode=decode, rotary_index=rotary_index)
 
     # Apply attention.
     x = self.attention_fn(
@@ -1445,20 +1535,59 @@ class MultiQueryDotProductAttention(nn.Module, DenseAttention):
         use_extra_logit=self.use_extra_logit,
         float32_logits=self.float32_logits)  # pytype: disable=wrong-keyword-args
 
+    # During decode we typically want to reshard at this point from sharding by
+    # batch to sharding by head. Return to the old names of the sharding axes to
+    # allow this reshard.
+    x = flax_partitioning.with_sharding_constraint(
+        x, (f'{sharding_prefix}_batch', f'{sharding_prefix}_q_length',
+            f'{sharding_prefix}_heads', 'kv'),
+        fallback=RulesFallback.NO_CONSTRAINT)
+    x = flax_partitioning.with_sharding_constraint(
+        x, ('batch', 'length', 'heads', 'kv'),
+        fallback=RulesFallback.NO_CONSTRAINT)
+
     if precomputed_qkv is None:
-      # Back to the original inputs dimensions.
-      out = dense.DenseGeneral(
-          features=features,
-          axis=(-2, -1),
-          kernel_init=self.kernel_init,
-          bias_init=self.bias_init,
-          use_bias=self.use_bias,
-          dtype=self.dtype,
-          precision=self.precision,
-          kernel_axis_names=['heads', 'kv', 'embed'],
-          reshape_kernel=not self.split_head_kernel,
-          name='out')(  # pytype: disable=wrong-arg-types
-              x)
+      kernel_axis_names = ['heads', 'kv', 'embed']
+      # TODO: activation quantization support is unimplemented
+      # here.
+      if self.use_aqt and self.weight_params is not None:
+        weight_prec = self.weight_params.prec if self.weight_params else None
+        half_shift = self.weight_params.half_shift if self.weight_params else False
+        aqt_hparams = aqt_flax_layers.DenseGeneralAqt.HParams(
+            weight_prec=weight_prec,
+            weight_half_shift=half_shift,
+            quant_act=None,  # currently supports fixed bounds only.
+            weight_quant_granularity=aqt_config.QuantGranularity.PER_CHANNEL,
+        )
+        out = aqt_flax_layers.DenseGeneralAqt(
+            hparams=aqt_hparams,
+            train=enable_dropout,
+            possibly_use_quantized_vars=self.possibly_use_quantized_vars,
+            features=features,
+            axis=(-2, -1),
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init,
+            use_bias=self.use_bias,
+            dtype=self.dtype,
+            precision=self.precision,
+            kernel_axis_names=kernel_axis_names,
+            reshape_kernel=not self.split_head_kernel,
+            name='out')(  # pytype: disable=wrong-arg-types
+                x)
+      else:
+        # Back to the original inputs dimensions.
+        out = dense.DenseGeneral(
+            features=features,
+            axis=(-2, -1),
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init,
+            use_bias=self.use_bias,
+            dtype=self.dtype,
+            precision=self.precision,
+            kernel_axis_names=kernel_axis_names,
+            reshape_kernel=not self.split_head_kernel,
+            name='out')(  # pytype: disable=wrong-arg-types
+                x)
     else:
       # in fused parallel layer, fused outer dense operation is external
       out = x
@@ -1799,7 +1928,7 @@ def make_decoder_mask(decoder_target_tokens: Array,
   # [batch..., 1, length, length]
   causal_mask = make_causal_mask(decoder_target_tokens, dtype=dtype)
 
-  # Positions with value 1 in `decoder_causal_attneition` can attend
+  # Positions with value 1 in `decoder_causal_attention` can attend
   # bidirectionally.
   if decoder_causal_attention is not None:
     # [batch..., 1, length, length]
@@ -1854,10 +1983,10 @@ def validate_dense_attention_call_parameter_shapes(inputs_q: Array,
                          f'num_heads ({num_heads}), or 1')
     else:
       num_heads = mask.shape[-3]
-    if mask.shape[-2] != inputs_q.shape[-2]:
+    if mask.shape[-2] not in (1, inputs_q.shape[-2]):
       raise ValueError(f'Mismatched q_length: expected '
                        f'mask.shape[-2] ({mask.shape[-2]}) == '
-                       f'inputs_q.shape[-2] ({inputs_q.shape[-2]})')
+                       f'inputs_q.shape[-2] ({inputs_q.shape[-2]}), or 1')
     if mask.shape[-1] != inputs_kv.shape[-2]:
       raise ValueError(f'Mismatched kv_length: expected '
                        f'mask.shape[-1] ({mask.shape[-1]}) == '
