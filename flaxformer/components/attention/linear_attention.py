@@ -487,10 +487,6 @@ class MultiHeadLinearAttention(nn.Module, LinearAttention):
           key = jnp.einsum('...xl,...lhd->...lhd', mask, key)
           value = jnp.einsum('...xl,...lhd->...lhd', mask, value)
 
-    dropout_rng = None
-    if enable_dropout and self.dropout_rate > 0.:
-      dropout_rng = self.make_rng('dropout')
-
     if self.use_rotary_embedding:
       # use rotary embeddings before attention
       # https://arxiv.org/abs/2104.09864
@@ -515,6 +511,7 @@ class MultiHeadLinearAttention(nn.Module, LinearAttention):
         raise NotImplementedError
     if enable_dropout and self.dropout_rate > 0.:
         raise NotImplementedError
+    
     x = self.attention_fn(
         query,
         key,
